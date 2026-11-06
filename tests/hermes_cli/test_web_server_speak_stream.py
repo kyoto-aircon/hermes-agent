@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from urllib.parse import urlencode
 
@@ -93,6 +94,38 @@ def test_streams_pcm_frames_then_end(stream_client, monkeypatch):
     assert streamer.requests == ["Hello there."]
 
 
+def test_consecutive_replies_each_open_a_fresh_stream(stream_client, monkeypatch):
+    """Regression: every TTS reply dials a NEW speak-stream socket, so consecutive
+    dials must each pass auth and stream a full start -> PCM -> end cycle."""
+    streamer = _FakeStreamer([b"\x01\x02"])
+    _patch_provider(monkeypatch, streamer)
+
+    for i in range(3):
+        with stream_client.websocket_connect(_url()) as conn:
+            conn.send_text(json.dumps({"text": f"Reply number {i}.", "done": True}))
+            assert conn.receive_json() == {"type": "start", "sample_rate": 24000, "channels": 1}
+            assert conn.receive_bytes() == b"\x01\x02"
+            assert conn.receive_json() == {"type": "end"}
+
+    assert streamer.requests == [f"Reply number {i}." for i in range(3)]
+
+
+def test_rejected_upgrade_logs_reason_without_secret(stream_client, caplog):
+    """A bad credential is refused pre-accept (client sees HTTP 403 / close 4401) and the
+    log carries the reason token only - never the presented secret."""
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.web_server"):
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            with stream_client.websocket_connect(_url(token="wrong-token")):
+                pass
+
+    assert excinfo.value.code == 4401
+    assert any(
+        "speak-stream auth rejected reason=token_mismatch" in record.getMessage()
+        and "wrong-token" not in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_short_cjk_opener_is_synthesized_alone_with_configured_min_len(stream_client, monkeypatch):
     """speak_stream_ws cuts with the requesting profile's tts.streaming.min_len (#96927): a 7-char
     CJK opener gets its own provider request instead of riding behind the second sentence."""
@@ -101,7 +134,7 @@ def test_short_cjk_opener_is_synthesized_alone_with_configured_min_len(stream_cl
     monkeypatch.setattr("tools.tts_tool._load_tts_config", lambda: {"streaming": {"min_len": 6}})
 
     with stream_client.websocket_connect(_url()) as conn:
-        conn.send_text(json.dumps({"text": "记得，叫团团. 然后我们再说第二句话，这一句要长一些才行. ", "done": True}))
+        conn.send_text(json.dumps({"text": "记录，叫回回. 然后我们再说第二句话，这一句要长一些才行. ", "done": True}))
         # The start frame is deferred until the first PCM chunk (rate learned from the endpoint).
         assert conn.receive_json()["type"] == "start"
         while True:
@@ -110,7 +143,7 @@ def test_short_cjk_opener_is_synthesized_alone_with_configured_min_len(stream_cl
                 assert json.loads(message["text"]) == {"type": "end"}
                 break
 
-    assert streamer.requests[0] == "记得，叫团团.", streamer.requests
+    assert streamer.requests[0] == "记录，叫回回.", streamer.requests
 
 
 
@@ -221,5 +254,4 @@ def test_edge_speak_stream_speaks_each_sentence_instead_of_whole_text_fallback(
     assert first in calls[0] and second not in calls[0]
     assert second in calls[1] and first not in calls[1]
     assert reply not in calls
-
 

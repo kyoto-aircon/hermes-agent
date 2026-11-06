@@ -1,4 +1,3 @@
-"""Audio dashboard routes: transcription upload + live transcribe-stream, voice config, ElevenLabs voices, TTS speak/lease and the speak-stream WebSocket.
 
 Extracted from ``hermes_cli.web_server``; helpers/state that tests monkeypatch on
 ``web_server`` stay there and are late-bound (cycle-safe).
@@ -19,7 +18,12 @@ import urllib.request
 from fastapi import APIRouter
 from hermes_cli.web_routers._common import http_failure
 from hermes_cli.web_deps import late
-from hermes_cli.web_server_chat import _ws_auth_ok, _ws_request_is_allowed
+from hermes_cli.web_server_chat import (
+    _ws_auth_reason,
+    _ws_client_reason,
+    _ws_host_origin_reason,
+    _ws_request_is_allowed,
+)
 from hermes_cli.web_server_gateway import _read_dashboard_json_response, _split_text_for_speak_stream
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 from hermes_cli.web_models import (
@@ -189,8 +193,8 @@ async def get_voice_live_status(profile: Optional[str] = None):
 async def create_voice_live_session(payload: VoiceLiveSessionRequest, profile: Optional[str] = None):
     """Exchange the renderer's WebRTC SDP offer for a GPT-Live session answer.
 
-    The project API key stays on this host; the renderer only receives the session id and the
-    SDP answer. Client delegation is fixed at creation: every ``session.delegation.created`` the
+    The project API key stays on this host; the renderer only receives the session id and
+    the SDP answer. Client delegation is fixed at creation: every ``session.delegation.created`` the
     renderer receives becomes a Hermes turn on the session it belongs to.
     """
     from tools.voice_live import create_webrtc_session
@@ -302,8 +306,7 @@ async def speak_text(payload: TTSSpeakRequest, profile: Optional[str] = None):
     if not text:
         raise HTTPException(status_code=400, detail="Text is required")
 
-    # _config_profile_scope raises 400/404 for a bad profile — pass it
-    # through instead of masking it as a 500 synthesis failure.
+    # _config_profile_scope raises 400/404 for a bad profile — pass it through instead of masking it as a 500 synthesis failure.
     with http_failure("Desktop voice TTS failed", 500, "Speech synthesis failed"):
         from tools.tts_tool import text_to_speech_tool
 
@@ -525,11 +528,15 @@ async def transcribe_stream_ws(ws: WebSocket) -> None:
                ``{"type": "error", "message": ...}`` — also when no live STT is available, so the
                client falls back to ``POST /api/audio/transcribe`` with its recorded blob.
     """
-    if not _ws_auth_ok(ws):
-        await ws.close(code=4401)
+    reason, cred = _ws_auth_reason(ws)
+    if reason is not None:
+        _log.warning("transcribe-stream auth rejected reason=%s cred=%s peer=%s", reason, cred, ws.client.host if ws.client else "?")
+        await ws.close(code=4401, reason=reason[:120])
         return
-    if not _ws_request_is_allowed(ws):
-        await ws.close(code=4403)
+    boundary = _ws_host_origin_reason(ws) or _ws_client_reason(ws)
+    if boundary is not None:
+        _log.warning("transcribe-stream boundary rejected reason=%s peer=%s", boundary, ws.client.host if ws.client else "?")
+        await ws.close(code=4403, reason=boundary[:120])
         return
     await ws.accept()
 
@@ -611,11 +618,15 @@ async def speak_stream_ws(ws: WebSocket) -> None:
                still speak per sentence via ``text_to_speech_tool`` and stream
                that PCM — the client POST is the last resort, not the Edge path.
     """
-    if not _ws_auth_ok(ws):
-        await ws.close(code=4401)
+    reason, cred = _ws_auth_reason(ws)
+    if reason is not None:
+        _log.warning("speak-stream auth rejected reason=%s cred=%s peer=%s", reason, cred, ws.client.host if ws.client else "?")
+        await ws.close(code=4401, reason=reason[:120])
         return
-    if not _ws_request_is_allowed(ws):
-        await ws.close(code=4403)
+    boundary = _ws_host_origin_reason(ws) or _ws_client_reason(ws)
+    if boundary is not None:
+        _log.warning("speak-stream boundary rejected reason=%s peer=%s", boundary, ws.client.host if ws.client else "?")
+        await ws.close(code=4403, reason=boundary[:120])
         return
     await ws.accept()
 
